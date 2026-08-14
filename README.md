@@ -13,6 +13,14 @@ approval gate before any SAR escalation. Tested end-to-end (see "What's verified
 - **Multi-agent pipeline** (LangGraph): Transaction → Customer → GraphRAG → Compliance →
   Supervisor, converging on a risk-scored decision with full evidence trail.
   `app/agents/investigation_graph.py`
+- **API key authentication**: every endpoint except `/health` requires an `X-API-Key`
+  header matching the `API_KEY` env var. If `API_KEY` isn't set, auth is disabled
+  (open access) for local dev — the app logs a loud warning on startup so this is
+  never silently forgotten in production. `app/api/auth.py`
+- **Persistent case storage**: Postgres-backed (`DATABASE_URL`) with an in-memory
+  fallback for local dev. Cases and their approval status now survive restarts when
+  Postgres is configured — this matters especially on platforms like Render where
+  free-tier containers spin down on inactivity. `app/core/case_store.py`
 - **Checkpointed, resumable state**: SQLite by default, Postgres in production
   (`DATABASE_URL`). Investigations survive process restarts.
 - **Human-in-the-loop approval gate**: any case the Supervisor proposes to escalate to
@@ -32,6 +40,9 @@ approval gate before any SAR escalation. Tested end-to-end (see "What's verified
 - `/sar/{id}` on an approved case → returns a narrative
 - `/investigate` on a normal transaction → `CLEAR` / `CLOSED`, no approval needed
 - `/cases?status=OPEN` filtering
+- **Auth**: no `X-API-Key` header → 401; wrong key → 401; correct key → 200;
+  `/health` stays open either way (needed for platform health checks)
+- **Deployed live on Render** and manually verified end-to-end through the Swagger UI
 
 ## What's NOT verified / not built
 

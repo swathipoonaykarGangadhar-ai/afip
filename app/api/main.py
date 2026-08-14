@@ -1,39 +1,57 @@
 """
-AFIP API — v0.2, wired to the checkpointed multi-agent graph.
+AFIP API — v0.3: persistent case storage + API key auth.
 
-Endpoints:
-  POST /investigate           -> run the agent pipeline on a transaction_id
+Endpoints (all require X-API-Key header if API_KEY env var is set;
+/health is always open):
+  POST /investigate            -> run the agent pipeline on a transaction_id
   POST /case/{case_id}/approve -> analyst approves/rejects a pending SAR escalation
-  GET  /case/{case_id}        -> retrieve a case (including pending-approval state)
-  POST /sar/{case_id}         -> generate a SAR narrative for an escalated+approved case
-  GET  /cases                 -> list cases, optionally filtered by status
-  GET  /health                -> liveness
+  GET  /case/{case_id}         -> retrieve a case (including pending-approval state)
+  POST /sar/{case_id}          -> generate a SAR narrative for an escalated+approved case
+  GET  /cases                  -> list cases, optionally filtered by status
+  GET  /health                 -> liveness (no auth required)
 
 On startup, loads synthetic data into memory + the graph store, and
-trains/loads the fraud model. Swap `DATA` for real Kafka/Snowflake/
-Postgres sources when moving past the prototype stage — the agent
-graph itself doesn't care where the data came from.
+trains/loads the fraud model. Swap `DATA` for real Kafka/Snowflake
+sources when moving past the prototype stage — the agent graph itself
+doesn't care where the data came from.
 """
 import uuid
 import os
+import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 
 from app.core.synthetic_data import generate_dataset
+from app.core import case_store
 from app.graph.graph_store import InMemoryGraphStore
 from app.agents.investigation_graph import build_investigation_graph, set_graph_store
 from app.agents.narration import generate_sar_narrative
 from app.ml import fraud_model
+from app.api.auth import require_api_key, auth_enabled
 from langgraph.types import Command
 
-app = FastAPI(title="Enterprise Agentic Fraud Investigation Platform", version="0.2.0")
+logger = logging.getLogger("afip")
 
-STATE = {"cases": {}}
+app = FastAPI(title="Enterprise Agentic Fraud Investigation Platform", version="0.3.0")
+
+STATE = {}
 
 
 @app.on_event("startup")
 def startup():
+    if not auth_enabled():
+        logger.warning(
+            "API_KEY is not set -- this deployment has NO AUTHENTICATION. "
+            "Anyone with the URL can approve/reject SAR escalations. "
+            "Set API_KEY before using this with anything real."
+        )
+    if not case_store.is_persistent():
+        logger.warning(
+            "DATABASE_URL is not set -- cases are stored in-memory only "
+            "and will be LOST on restart/redeploy/scale-to-zero."
+        )
+
     ds = generate_dataset(n_customers=300, n_transactions=4000)
     if not os.path.exists(fraud_model.MODEL_PATH):
         fraud_model.train(ds["transactions"])
@@ -61,7 +79,12 @@ class ApprovalRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ready": STATE.get("ready", False)}
+    return {
+        "status": "ok",
+        "ready": STATE.get("ready", False),
+        "auth_enabled": auth_enabled(),
+        "persistent_storage": case_store.is_persistent(),
+    }
 
 
 def _extract_findings(result: dict) -> dict:
@@ -73,7 +96,7 @@ def _extract_findings(result: dict) -> dict:
     }
 
 
-@app.post("/investigate")
+@app.post("/investigate", dependencies=[Depends(require_api_key)])
 def investigate(req: InvestigateRequest):
     txn = STATE["transactions_by_id"].get(req.transaction_id)
     if not txn:
@@ -109,13 +132,13 @@ def investigate(req: InvestigateRequest):
         "status": "PENDING_APPROVAL" if pending_approval else ("OPEN" if decision != "CLEAR" else "CLOSED"),
         "created_date": datetime.utcnow().isoformat(),
     }
-    STATE["cases"][case_id] = case
+    case_store.save_case(case)
     return case
 
 
-@app.post("/case/{case_id}/approve")
+@app.post("/case/{case_id}/approve", dependencies=[Depends(require_api_key)])
 def approve_case(case_id: str, req: ApprovalRequest):
-    case = STATE["cases"].get(case_id)
+    case = case_store.get_case(case_id)
     if not case:
         raise HTTPException(status_code=404, detail=f"Unknown case_id {case_id}")
     if case["status"] != "PENDING_APPROVAL":
@@ -133,20 +156,21 @@ def approve_case(case_id: str, req: ApprovalRequest):
     case["final_decision"] = result["final_decision"]
     case["status"] = "OPEN" if result["final_decision"] != "CLEAR" else "CLOSED"
     case["human_approval"] = req.decision
+    case_store.save_case(case)
     return case
 
 
-@app.get("/case/{case_id}")
+@app.get("/case/{case_id}", dependencies=[Depends(require_api_key)])
 def get_case(case_id: str):
-    case = STATE["cases"].get(case_id)
+    case = case_store.get_case(case_id)
     if not case:
         raise HTTPException(status_code=404, detail=f"Unknown case_id {case_id}")
     return case
 
 
-@app.post("/sar/{case_id}")
+@app.post("/sar/{case_id}", dependencies=[Depends(require_api_key)])
 def generate_sar(case_id: str):
-    case = STATE["cases"].get(case_id)
+    case = case_store.get_case(case_id)
     if not case:
         raise HTTPException(status_code=404, detail=f"Unknown case_id {case_id}")
     if case["final_decision"] != "ESCALATE_SAR":
@@ -159,10 +183,7 @@ def generate_sar(case_id: str):
     return {"case_id": case_id, "sar_narrative": narrative, "generated_date": datetime.utcnow().isoformat()}
 
 
-@app.get("/cases")
+@app.get("/cases", dependencies=[Depends(require_api_key)])
 def list_cases(status: str | None = None):
-    cases = list(STATE["cases"].values())
-    if status:
-        cases = [c for c in cases if c["status"] == status]
+    cases = case_store.list_cases(status=status)
     return {"count": len(cases), "cases": cases}
-
