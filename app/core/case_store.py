@@ -8,6 +8,7 @@ in-process. Falls back to an in-memory dict for local dev without a
 database, so nothing breaks if DATABASE_URL isn't set -- it just won't
 persist across restarts.
 """
+from psycopg.types.json import Jsonb
 import os
 import json
 from datetime import datetime
@@ -54,7 +55,7 @@ def save_case(case: dict) -> None:
                 ON CONFLICT (case_id) DO UPDATE
                 SET data = EXCLUDED.data, status = EXCLUDED.status
                 """,
-                (case["case_id"], json.dumps(case), case["status"]),
+                (case["case_id"], Jsonb(case, dumps=lambda o: json.dumps(o, default=str)), case["status"]),
             )
             conn.commit()
     else:
