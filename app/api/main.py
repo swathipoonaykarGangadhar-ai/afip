@@ -65,8 +65,18 @@ def startup():
 
     store = get_graph_store()
     if isinstance(store, Neo4jGraphStore):
-        logger.info("Connected to Neo4j at %s -- loading synthetic data into it.", os.environ.get("NEO4J_URI"))
-    store.load_data(ds["customers"], ds["accounts"], ds["transactions"])
+        logger.info("Connected to Neo4j at %s", os.environ.get("NEO4J_URI"))
+    if store.is_empty():
+        # Only seed on first startup. Without this check, every restart
+        # would regenerate synthetic data and reload it via MERGE, which
+        # creates NEW duplicate relationships instead of deduping (MERGE
+        # matches on the pattern, not on differing timestamp/amount
+        # properties) -- so a persistent Neo4j instance would silently
+        # accumulate duplicate fraud-ring edges across every restart.
+        logger.info("Graph store is empty -- seeding with synthetic data.")
+        store.load_data(ds["customers"], ds["accounts"], ds["transactions"])
+    else:
+        logger.info("Graph store already has data -- skipping seed (using existing data).")
     set_graph_store(store)  # context-scoped; see investigation_graph.py for why
 
     STATE["transactions_by_id"] = {t["transaction_id"]: t for t in ds["transactions"]}

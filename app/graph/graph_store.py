@@ -18,6 +18,13 @@ class InMemoryGraphStore:
     def __init__(self):
         self.g = nx.MultiDiGraph()
 
+    def is_empty(self) -> bool:
+        # Always considered empty -- this backend is rebuilt fresh in
+        # memory on every process start anyway, so "only seed if empty"
+        # and "always seed" are equivalent here. Exists so callers can
+        # treat both backends polymorphically without isinstance checks.
+        return True
+
     def load_data(self, customers, accounts, transactions):
         for c in customers:
             self.g.add_node(c["customer_id"], type="Customer", **c)
@@ -121,6 +128,11 @@ class Neo4jGraphStore:
 
     def close(self):
         self.driver.close()
+
+    def is_empty(self) -> bool:
+        with self.driver.session() as session:
+            result = session.run("MATCH (n) RETURN count(n) AS c")
+            return result.single()["c"] == 0
 
     def load_data(self, customers, accounts, transactions):
         with self.driver.session() as session:
