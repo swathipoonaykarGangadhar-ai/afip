@@ -135,36 +135,71 @@ class Neo4jGraphStore:
             return result.single()["c"] == 0
 
     def load_data(self, customers, accounts, transactions):
+        """
+        Batched via UNWIND -- a handful of round-trips instead of one
+        network call per row. With ~300 customers + ~450 accounts +
+        ~4000 transactions, the original one-row-per-query approach was
+        thousands of sequential round-trips to a real cloud database,
+        which is slow and, on a free-tier instance under load, can fail
+        or time out partway through -- silently leaving the graph with
+        incomplete data (e.g. missing the very TRANSFERRED_TO edges the
+        fraud-ring detection query depends on). Batching removes that
+        failure mode entirely, independent of tier/plan/network conditions.
+        """
         with self.driver.session() as session:
-            for c in customers:
+            session.run(
+                "UNWIND $rows AS row "
+                "MERGE (c:Customer {customer_id: row.customer_id}) "
+                "SET c += row",
+                rows=customers,
+            )
+            session.run(
+                "UNWIND $rows AS row "
+                "MERGE (acc:Account {account_id: row.account_id}) "
+                "WITH acc, row MATCH (c:Customer {customer_id: row.customer_id}) "
+                "MERGE (c)-[:OWNS]->(acc)",
+                rows=accounts,
+            )
+
+            device_rows = [
+                {"device_id": t["device_id"], "account_id": t["account_id"]}
+                for t in transactions if t.get("device_id")
+            ]
+            if device_rows:
                 session.run(
-                    "MERGE (c:Customer {customer_id: $id}) "
-                    "SET c += $props",
-                    id=c["customer_id"], props=c,
+                    "UNWIND $rows AS row "
+                    "MERGE (d:Device {device_id: row.device_id}) "
+                    "WITH d, row MATCH (acc:Account {account_id: row.account_id}) "
+                    "MERGE (acc)-[:USES]->(d)",
+                    rows=device_rows,
                 )
-            for a in accounts:
+
+            ip_rows = [
+                {"ip_address": t["ip_address"], "account_id": t["account_id"]}
+                for t in transactions if t.get("ip_address")
+            ]
+            if ip_rows:
                 session.run(
-                    "MERGE (acc:Account {account_id: $id}) "
-                    "WITH acc MATCH (c:Customer {customer_id: $cust_id}) "
-                    "MERGE (c)-[:OWNS]->(acc)",
-                    id=a["account_id"], cust_id=a["customer_id"],
+                    "UNWIND $rows AS row "
+                    "MERGE (ip:IPAddress {ip_address: row.ip_address}) "
+                    "WITH ip, row MATCH (acc:Account {account_id: row.account_id}) "
+                    "MERGE (acc)-[:USES]->(ip)",
+                    rows=ip_rows,
                 )
-            for t in transactions:
-                if t.get("device_id"):
-                    session.run(
-                        "MERGE (d:Device {device_id: $dev}) "
-                        "WITH d MATCH (acc:Account {account_id: $acc}) "
-                        "MERGE (acc)-[:USES]->(d)",
-                        dev=t["device_id"], acc=t["account_id"],
-                    )
-                if t.get("transferred_to"):
-                    session.run(
-                        "MATCH (a:Account {account_id: $from_acc}) "
-                        "MATCH (b:Account {account_id: $to_acc}) "
-                        "MERGE (a)-[r:TRANSFERRED_TO {amount: $amt, timestamp: $ts}]->(b)",
-                        from_acc=t["account_id"], to_acc=t["transferred_to"],
-                        amt=t["amount"], ts=t["timestamp"],
-                    )
+
+            transfer_rows = [
+                {"from_acc": t["account_id"], "to_acc": t["transferred_to"],
+                 "amount": t["amount"], "timestamp": t["timestamp"]}
+                for t in transactions if t.get("transferred_to")
+            ]
+            if transfer_rows:
+                session.run(
+                    "UNWIND $rows AS row "
+                    "MATCH (a:Account {account_id: row.from_acc}) "
+                    "MATCH (b:Account {account_id: row.to_acc}) "
+                    "MERGE (a)-[r:TRANSFERRED_TO {amount: row.amount, timestamp: row.timestamp}]->(b)",
+                    rows=transfer_rows,
+                )
 
     def find_fraud_rings(self, min_ring_size=3, max_shared_group_size=15,
                           min_ring_density=0.6):
