@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from app.core.synthetic_data import generate_dataset
 from app.core import case_store
-from app.graph.graph_store import InMemoryGraphStore
+from app.graph.graph_store import get_graph_store, Neo4jGraphStore
 from app.agents.investigation_graph import build_investigation_graph, set_graph_store
 from app.agents.narration import generate_sar_narrative
 from app.ml import fraud_model
@@ -51,12 +51,21 @@ def startup():
             "DATABASE_URL is not set -- cases are stored in-memory only "
             "and will be LOST on restart/redeploy/scale-to-zero."
         )
+    if not os.environ.get("NEO4J_URI"):
+        logger.warning(
+            "NEO4J_URI is not set -- using an in-memory graph rebuilt from "
+            "synthetic data on every startup. No real transaction network "
+            "data, no persistence. Set NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD "
+            "to use a real graph database."
+        )
 
     ds = generate_dataset(n_customers=300, n_transactions=4000)
     if not os.path.exists(fraud_model.MODEL_PATH):
         fraud_model.train(ds["transactions"])
 
-    store = InMemoryGraphStore()
+    store = get_graph_store()
+    if isinstance(store, Neo4jGraphStore):
+        logger.info("Connected to Neo4j at %s -- loading synthetic data into it.", os.environ.get("NEO4J_URI"))
     store.load_data(ds["customers"], ds["accounts"], ds["transactions"])
     set_graph_store(store)  # context-scoped; see investigation_graph.py for why
 
@@ -84,6 +93,7 @@ def health():
         "ready": STATE.get("ready", False),
         "auth_enabled": auth_enabled(),
         "persistent_storage": case_store.is_persistent(),
+        "graph_backend": "neo4j" if isinstance(STATE.get("graph_store"), Neo4jGraphStore) else "in-memory",
     }
 
 

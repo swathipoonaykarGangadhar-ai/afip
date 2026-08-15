@@ -154,28 +154,81 @@ class Neo4jGraphStore:
                         amt=t["amount"], ts=t["timestamp"],
                     )
 
-    def find_fraud_rings(self, min_ring_size=3):
-        query = """
-        MATCH (a1:Account)-[:USES]->(shared)<-[:USES]-(a2:Account)
-        WHERE a1 <> a2 AND (shared:Device OR shared:IPAddress)
-        WITH shared, collect(DISTINCT a1) + collect(DISTINCT a2) AS accts
-        UNWIND accts AS acct
-        WITH shared, collect(DISTINCT acct) AS accounts
-        WHERE size(accounts) >= $min_size
-        RETURN shared, accounts
+    def find_fraud_rings(self, min_ring_size=3, max_shared_group_size=15,
+                          min_ring_density=0.6):
         """
+        Mirrors InMemoryGraphStore.find_fraud_rings()'s logic exactly, so
+        callers get identical behavior regardless of backend: require
+        actual TRANSFERRED_TO edges among the device/IP-sharing group
+        (not just coincidental shared infrastructure), with the same
+        false-positive guardrails (group size cap, density threshold).
+        Returns plain strings/primitives only -- never raw Neo4j Node
+        objects -- so results are JSON-serializable and match the shape
+        the agent pipeline and API expect. Plain Cypher only (no APOC
+        dependency), since APOC isn't guaranteed available on every
+        managed Neo4j tier (e.g. some AuraDB Free configurations).
+        """
+        query = """
+        MATCH (shared)
+        WHERE shared:Device OR shared:IPAddress
+        MATCH (acct:Account)-[:USES]->(shared)
+        WITH shared, collect(DISTINCT acct.account_id) AS connected_accounts
+        WHERE size(connected_accounts) >= $min_size AND size(connected_accounts) <= $max_group_size
+        MATCH (a:Account)-[t:TRANSFERRED_TO]->(b:Account)
+        WHERE a.account_id IN connected_accounts AND b.account_id IN connected_accounts
+        WITH shared, connected_accounts,
+             collect(DISTINCT a.account_id) + collect(DISTINCT b.account_id) AS participants_raw,
+             collect({from: a.account_id, to: b.account_id, amount: t.amount, timestamp: t.timestamp}) AS transfer_chain
+        UNWIND participants_raw AS p
+        WITH shared, connected_accounts, collect(DISTINCT p) AS participants, transfer_chain
+        WHERE size(participants) * 1.0 / size(connected_accounts) >= $min_density
+        RETURN
+            CASE WHEN 'Device' IN labels(shared) THEN shared.device_id ELSE shared.ip_address END AS shared_entity,
+            connected_accounts AS accounts,
+            participants AS ring_participants,
+            transfer_chain,
+            (0.6 + 0.08 * size(participants)) AS risk_score
+        """
+        params = {
+            "min_size": min_ring_size,
+            "max_group_size": max_shared_group_size,
+            "min_density": min_ring_density,
+        }
         with self.driver.session() as session:
-            result = session.run(query, min_size=min_ring_size)
-            return [dict(record) for record in result]
+            result = session.run(query, **params)
+            records = [record.data() for record in result]
+            for r in records:
+                r["risk_score"] = min(0.99, r["risk_score"])
+            return records
 
     def get_customer_neighborhood(self, customer_id, depth=2):
+        """
+        Returns plain dicts (matching InMemoryGraphStore's shape:
+        {"nodes": [...], "edges": [...]}), not raw Neo4j Path objects --
+        so this is JSON-serializable and consistent across both backends.
+        """
         query = f"""
         MATCH path = (c:Customer {{customer_id: $cid}})-[*1..{depth}]-(n)
         RETURN path
         """
+        nodes_by_id = {}
+        edges = []
         with self.driver.session() as session:
             result = session.run(query, cid=customer_id)
-            return [record["path"] for record in result]
+            for record in result:
+                path = record["path"]
+                for node in path.nodes:
+                    node_id = (node.get("customer_id") or node.get("account_id")
+                               or node.get("device_id") or node.get("ip_address") or node.element_id)
+                    nodes_by_id[node_id] = {"id": node_id, "labels": list(node.labels), **dict(node)}
+                for rel in path.relationships:
+                    edges.append({
+                        "from": dict(rel.start_node).get("account_id") or dict(rel.start_node).get("customer_id"),
+                        "to": dict(rel.end_node).get("account_id") or dict(rel.end_node).get("customer_id"),
+                        "rel": rel.type,
+                        **dict(rel),
+                    })
+        return {"nodes": list(nodes_by_id.values()), "edges": edges}
 
 
 def get_graph_store():
