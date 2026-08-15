@@ -244,26 +244,45 @@ def build_investigation_graph():
     return graph.compile(checkpointer=checkpointer)
 
 
+_pg_checkpoint_pool = None  # module-level so it's never garbage collected
+
+
 def get_checkpointer():
     """
     PostgresSaver if DATABASE_URL is set (production), otherwise a local
     SQLite file (dev/prototype). Either way, checkpointing is real --
     investigations survive process restarts and support time-travel
     debugging via the same API.
+
+    IMPORTANT: both branches keep a persistent connection/pool referenced
+    at module level. The naive `from_conn_string(...).__enter__()` pattern
+    (or SqliteSaver.from_conn_string as a one-off) returns a connection
+    tied to a context manager that gets garbage-collected -- and closed --
+    almost immediately once the local variable holding it goes out of
+    scope, which surfaces later as `psycopg.OperationalError: the
+    connection is closed` on the first real request. Keeping an explicit
+    module-level reference avoids that.
     """
+    global _pg_checkpoint_pool
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
         from langgraph.checkpoint.postgres import PostgresSaver
-        saver_cm = PostgresSaver.from_conn_string(db_url)
-        saver = saver_cm.__enter__()
+        from psycopg_pool import ConnectionPool
+
+        if _pg_checkpoint_pool is None:
+            _pg_checkpoint_pool = ConnectionPool(
+                conninfo=db_url,
+                max_size=10,
+                kwargs={"autocommit": True, "prepare_threshold": 0},
+                open=True,
+            )
+        saver = PostgresSaver(_pg_checkpoint_pool)
         saver.setup()
         return saver
 
     from langgraph.checkpoint.sqlite import SqliteSaver
     import sqlite3
     db_path = os.path.join(os.path.dirname(__file__), "..", "..", "afip_checkpoints.sqlite")
-    # Keep the connection open explicitly rather than via the contextmanager
-    # helper -- the cm form gets closed by GC of the unreferenced generator.
     conn = sqlite3.connect(db_path, check_same_thread=False)
     saver = SqliteSaver(conn)
     saver.setup()
