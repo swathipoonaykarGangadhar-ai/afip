@@ -22,6 +22,9 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("afip")
+
 from app.core.synthetic_data import generate_dataset
 from app.core import case_store
 from app.graph.graph_store import get_graph_store, Neo4jGraphStore
@@ -30,8 +33,6 @@ from app.agents.narration import generate_sar_narrative
 from app.ml import fraud_model
 from app.api.auth import require_api_key, auth_enabled
 from langgraph.types import Command
-
-logger = logging.getLogger("afip")
 
 app = FastAPI(title="Enterprise Agentic Fraud Investigation Platform", version="0.3.0")
 
@@ -67,14 +68,19 @@ def startup():
     if isinstance(store, Neo4jGraphStore):
         logger.info("Connected to Neo4j at %s", os.environ.get("NEO4J_URI"))
     if store.is_empty():
-        # Only seed on first startup. Without this check, every restart
-        # would regenerate synthetic data and reload it via MERGE, which
-        # creates NEW duplicate relationships instead of deduping (MERGE
-        # matches on the pattern, not on differing timestamp/amount
-        # properties) -- so a persistent Neo4j instance would silently
-        # accumulate duplicate fraud-ring edges across every restart.
         logger.info("Graph store is empty -- seeding with synthetic data.")
-        store.load_data(ds["customers"], ds["accounts"], ds["transactions"])
+        try:
+            store.load_data(ds["customers"], ds["accounts"], ds["transactions"])
+            logger.info("Graph seeding completed successfully.")
+        except Exception:
+            # On Render's free tier the container can be torn down for
+            # inactivity moments after a cold start, which can interrupt
+            # this seeding mid-flight. Don't crash the whole app over it --
+            # log it and let POST /admin/seed-graph (below) be the
+            # reliable, on-demand way to (re)seed once the service is
+            # confirmed live and staying up.
+            logger.exception("Graph seeding failed/was interrupted during startup. "
+                              "Call POST /admin/seed-graph once the service is confirmed live.")
     else:
         logger.info("Graph store already has data -- skipping seed (using existing data).")
     set_graph_store(store)  # context-scoped; see investigation_graph.py for why
@@ -105,6 +111,79 @@ def health():
         "persistent_storage": case_store.is_persistent(),
         "graph_backend": "neo4j" if isinstance(STATE.get("graph_store"), Neo4jGraphStore) else "in-memory",
     }
+
+
+@app.post("/admin/seed-graph", dependencies=[Depends(require_api_key)])
+def seed_graph(force: bool = False):
+    """
+    Explicitly (re)seed the graph store with synthetic data, synchronously,
+    while the service is confirmed live. Use this instead of relying on
+    automatic startup seeding -- on Render's free tier, the container can
+    be torn down for inactivity moments after a cold start, which can
+    interrupt startup-time seeding mid-write and leave the graph empty or
+    partially loaded. Calling this endpoint directly avoids that race
+    entirely: the HTTP response only returns after the write actually
+    completes, so a 200 here is real proof the data is fully in place.
+
+    force=false (default): only seeds if the graph is currently empty.
+    force=true: wipes existing data first, then reseeds from scratch --
+    use this to fix a partially-seeded or duplicate-laden graph.
+    """
+    store = STATE["graph_store"]
+    if isinstance(store, Neo4jGraphStore) and force:
+        with store.driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+        logger.info("Cleared existing graph data (force=true).")
+
+    if not force and not store.is_empty():
+        return {
+            "status": "skipped",
+            "reason": "graph store already has data; pass ?force=true to wipe and reseed",
+        }
+
+    customers = list(STATE["customers_by_id"].values())
+    accounts = list(STATE["accounts_by_id"].values())
+    transactions = list(STATE["transactions_by_id"].values())
+    store.load_data(customers, accounts, transactions)
+
+    result = {
+        "status": "seeded",
+        "customers": len(customers),
+        "accounts": len(accounts),
+        "transactions": len(transactions),
+    }
+    if isinstance(store, Neo4jGraphStore):
+        with store.driver.session() as session:
+            counts = session.run(
+                "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS c ORDER BY label"
+            )
+            result["node_counts"] = {r["label"]: r["c"] for r in counts}
+    logger.info("Graph seeding via /admin/seed-graph completed: %s", result)
+    return result
+
+
+@app.get("/admin/graph-status", dependencies=[Depends(require_api_key)])
+def graph_status():
+    """Direct visibility into what's actually in the graph store right
+    now -- node counts by label, and whether the known fraud ring
+    (TXRING0000-4) is currently detectable. Use this instead of the
+    Neo4j Aura console to verify state without leaving the API."""
+    store = STATE["graph_store"]
+    result = {"backend": "neo4j" if isinstance(store, Neo4jGraphStore) else "in-memory"}
+    if isinstance(store, Neo4jGraphStore):
+        with store.driver.session() as session:
+            counts = session.run(
+                "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS c ORDER BY label"
+            )
+            result["node_counts"] = {r["label"]: r["c"] for r in counts}
+            rel_counts = session.run(
+                "MATCH ()-[r]->() RETURN type(r) AS rel, count(*) AS c ORDER BY rel"
+            )
+            result["relationship_counts"] = {r["rel"]: r["c"] for r in rel_counts}
+    rings = store.find_fraud_rings()
+    result["rings_detected"] = len(rings)
+    result["rings"] = rings
+    return result
 
 
 def _extract_findings(result: dict) -> dict:
