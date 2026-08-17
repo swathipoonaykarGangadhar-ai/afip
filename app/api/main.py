@@ -20,6 +20,7 @@ import os
 import logging
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -29,7 +30,7 @@ from app.core.synthetic_data import generate_dataset
 from app.core import case_store
 from app.graph.graph_store import get_graph_store, Neo4jGraphStore
 from app.agents.investigation_graph import build_investigation_graph, set_graph_store
-from app.agents.narration import generate_sar_narrative
+from app.agents.narration import generate_sar_narrative, chat_about_case
 from app.ml import fraud_model
 from app.api.auth import require_api_key, auth_enabled
 from langgraph.types import Command
@@ -37,6 +38,13 @@ from langgraph.types import Command
 app = FastAPI(title="Enterprise Agentic Fraud Investigation Platform", version="0.3.0")
 
 STATE = {}
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
+
+
+@app.get("/")
+def dashboard():
+    return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
 
 
 @app.on_event("startup")
@@ -100,6 +108,22 @@ class InvestigateRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     decision: str  # "approved" | "rejected"
+
+
+class CaseUpdateRequest(BaseModel):
+    priority: str | None = None
+    assignee: str | None = None
+    status: str | None = None
+
+
+class CommentRequest(BaseModel):
+    author: str
+    text: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list | None = None  # [{"role": "user"|"assistant", "content": "..."}]
 
 
 @app.get("/health")
@@ -219,6 +243,10 @@ def investigate(req: InvestigateRequest):
     pending_approval = "__interrupt__" in result
     decision = result.get("final_decision") or result.get("proposed_decision")
 
+    priority = "CRITICAL" if (result.get("final_risk_score") or 0) >= 0.9 else \
+               "HIGH" if (result.get("final_risk_score") or 0) >= 0.7 else \
+               "MEDIUM" if (result.get("final_risk_score") or 0) >= 0.4 else "LOW"
+
     case = {
         "case_id": case_id,
         "alert_id": req.transaction_id,
@@ -230,6 +258,9 @@ def investigate(req: InvestigateRequest):
         "explanation": result.get("explanation"),
         "status": "PENDING_APPROVAL" if pending_approval else ("OPEN" if decision != "CLEAR" else "CLOSED"),
         "created_date": datetime.utcnow().isoformat(),
+        "priority": priority,
+        "assignee": None,
+        "comments": [],
     }
     case_store.save_case(case)
     return case
@@ -265,6 +296,49 @@ def get_case(case_id: str):
     if not case:
         raise HTTPException(status_code=404, detail=f"Unknown case_id {case_id}")
     return case
+
+
+@app.patch("/case/{case_id}", dependencies=[Depends(require_api_key)])
+def update_case(case_id: str, req: CaseUpdateRequest):
+    case = case_store.get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Unknown case_id {case_id}")
+    if req.priority is not None:
+        if req.priority not in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            raise HTTPException(status_code=400, detail="priority must be LOW, MEDIUM, HIGH, or CRITICAL")
+        case["priority"] = req.priority
+    if req.assignee is not None:
+        case["assignee"] = req.assignee
+    if req.status is not None:
+        if req.status not in ("OPEN", "CLOSED", "PENDING_APPROVAL"):
+            raise HTTPException(status_code=400, detail="status must be OPEN, CLOSED, or PENDING_APPROVAL")
+        case["status"] = req.status
+    case_store.save_case(case)
+    return case
+
+
+@app.post("/case/{case_id}/comment", dependencies=[Depends(require_api_key)])
+def add_comment(case_id: str, req: CommentRequest):
+    case = case_store.get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Unknown case_id {case_id}")
+    comment = {
+        "author": req.author,
+        "text": req.text,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    case.setdefault("comments", []).append(comment)
+    case_store.save_case(case)
+    return case
+
+
+@app.post("/case/{case_id}/chat", dependencies=[Depends(require_api_key)])
+def chat(case_id: str, req: ChatRequest):
+    case = case_store.get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Unknown case_id {case_id}")
+    reply = chat_about_case(case, req.message, history=req.history)
+    return {"case_id": case_id, "reply": reply}
 
 
 @app.post("/sar/{case_id}", dependencies=[Depends(require_api_key)])

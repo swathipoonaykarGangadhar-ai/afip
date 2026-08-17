@@ -59,6 +59,61 @@ def narrate(summary: dict) -> str:
         return _template_narrative(summary)
 
 
+def chat_about_case(case: dict, message: str, history: list = None) -> str:
+    """
+    Free-form Q&A about a specific case, grounded in its actual data
+    (transaction, agent findings, comments). No template fallback here --
+    real Q&A genuinely needs an LLM, so without ANTHROPIC_API_KEY this
+    returns a clear message saying so rather than pretending to answer.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return ("Chat requires ANTHROPIC_API_KEY to be set on the server. "
+                "Ask your administrator to add it in the deployment's environment variables.")
+
+    try:
+        import anthropic
+        import json
+        client = anthropic.Anthropic(api_key=api_key)
+
+        context = {
+            "case_id": case.get("case_id"),
+            "transaction": case.get("transaction"),
+            "customer": case.get("customer"),
+            "agent_findings": case.get("agent_result"),
+            "final_decision": case.get("final_decision"),
+            "risk_score": case.get("final_risk_score"),
+            "explanation": case.get("explanation"),
+            "comments": case.get("comments", []),
+        }
+
+        system_prompt = (
+            "You are an assistant helping a fraud analyst review a specific case. "
+            "Answer only from the case data provided below -- never invent facts, "
+            "account numbers, or figures not present in it. If asked something the "
+            "data doesn't cover, say so plainly. Keep answers concise and factual, "
+            "in the tone of a colleague, not a chatbot.\n\n"
+            f"CASE DATA:\n{json.dumps(context, indent=2, default=str)}"
+        )
+
+        messages = list(history or [])
+        messages.append({"role": "user", "content": message})
+
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=500,
+            system=system_prompt,
+            messages=messages,
+        )
+        text_blocks = [b.text for b in response.content if b.type == "text"]
+        return "".join(text_blocks) if text_blocks else "I couldn't generate a response -- please try again."
+
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Chat request failed: {e}")
+        return f"Something went wrong answering that ({e.__class__.__name__}). Please try again."
+
+
 def generate_sar_narrative(case: dict) -> str:
     """LLM-generated SAR narrative, with the same template fallback pattern."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
